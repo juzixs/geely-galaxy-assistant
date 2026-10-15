@@ -49,11 +49,14 @@
  *    - jlyh_sign.js signnotify=1  只执行签到 + 强制开启通知（等效 sign notify=1）
  *
  * 4. Arcadia 面板适配（https://arcadia.cool/docs/api）
- *    - 通知：优先调用 Arcadia 消息中心 SDK（/arcadia/utils/message-sdk），
- *      失败则回退 Arcadia 内部接口 POST http://127.0.0.1:5678/api/inner/message/push，
- *      再失败才回退青龙的 ./sendNotify，最后兜底打印到日志；
- *      推送后可在「消息中心」配合「监控告警」规则转发到 Bark/钉钉等通知渠道
+ *    - 通知：采用「双通道同时推送」，两条通道并行执行、互不阻塞：
+ *      ① Arcadia 消息中心：优先 SDK（/arcadia/utils/message-sdk），
+ *        失败回退内部接口 POST http://127.0.0.1:5678/api/inner/message/push；
+ *        推送后可在「消息中心」配合「监控告警」规则转发到 Bark/钉钉等通知渠道
+ *      ② 同目录 sendNotify.js（与脚本一起同步，走 Bark/Server酱/PushPlus/TG 等渠道）
+ *      两条通道任意一条成功即视为已推送，全部失败才兜底打印日志
  *    - 环境变量：与青龙一致，在 Arcadia「环境变量」中添加 jlyh 即可
+ *      （sendNotify.js 所需的 PUSH_KEY / BARK_PUSH / TG_BOT_TOKEN 等按需配置）
  *    - 依赖：在 Arcadia「依赖管理」中安装 npm 依赖 mqtt、got@11.8.6、tough-cookie、iconv-lite
  *    - 定时任务：命令填 jlyh_sign.js（不带参数即默认签到 + 强制通知）
  *
@@ -2941,11 +2944,10 @@ function httpRequest(options, method = null) {
     });
 }
 // ==================== Arcadia/青龙 通知推送 ==================== //
-// 适配 Arcadia 面板消息中心（https://arcadia.cool/docs/message），推送链路：
-// 1. Arcadia 消息中心 SDK（面板内置 /arcadia/utils/message-sdk）
-// 2. Arcadia 内部 HTTP 接口 POST /api/inner/message/push
-// 3. 青龙面板 ./sendNotify
-// 4. 兜底：直接输出到日志
+// 适配 Arcadia 面板消息中心（https://arcadia.cool/docs/message），推送策略为「双通道同时推送」：
+// ① Arcadia 消息中心：优先 SDK（面板内置 /arcadia/utils/message-sdk），失败回退内部接口 POST /api/inner/message/push
+// ② 同目录 ./sendNotify.js（Bark/Server酱/PushPlus/TG 等渠道）
+// 两条通道互不阻塞、同时执行，任意一条成功即视为已推送；全部失败才兜底打印到日志
 async function sendNotifyMsg(title, content) {
     if (notifyForceOff) {
         console.log(content);
@@ -2955,6 +2957,21 @@ async function sendNotifyMsg(title, content) {
         : /✅/.test(content) ? 'success'
         : /⚠️|ℹ️/.test(content) ? 'warn'
         : 'info';
+
+    const results = await Promise.allSettled([
+        pushArcadiaMessage(title, content, type),
+        pushSendNotify(title, content)
+    ]);
+    const okArcadia = results[0].status === 'fulfilled' && results[0].value === true;
+    const okSendNotify = results[1].status === 'fulfilled' && results[1].value === true;
+    if (!okArcadia && !okSendNotify) {
+        // 两条通道都不可用，兜底输出
+        console.log(`[通知] ${title}\n${content}`);
+    }
+}
+
+// ① Arcadia 消息中心：SDK 优先，失败回退内部 HTTP 接口，成功返回 true
+async function pushArcadiaMessage(title, content, type) {
     // 1. Arcadia 消息中心 SDK
     try {
         const sdk = require('/arcadia/utils/message-sdk');
@@ -2962,22 +2979,28 @@ async function sendNotifyMsg(title, content) {
         if (typeof push === 'function') {
             await push(title, content, type);
             console.log(`✅ ${getFormattedTimestamp()} 已推送至 Arcadia 消息中心 [${type}]`);
-            return;
+            return true;
         }
-    } catch (e) { /* 非 Arcadia 环境或 SDK 不可用，继续回退 */ }
+    } catch (e) { /* 非 Arcadia 环境或 SDK 不可用，回退内部接口 */ }
     // 2. Arcadia 内部 HTTP 接口
     if (await arcadiaHttpPush(title, content, type)) {
         console.log(`✅ ${getFormattedTimestamp()} 已推送至 Arcadia 消息中心 [${type}]`);
-        return;
+        return true;
     }
-    // 3. 青龙面板 sendNotify
+    return false;
+}
+
+// ② 同目录 sendNotify.js，调用成功返回 true
+async function pushSendNotify(title, content) {
     try {
         const notify = require('./sendNotify');
-        await notify.sendNotify(title, content);
-        return;
-    } catch (e) { /* sendNotify 不存在，继续回退 */ }
-    // 4. 兜底
-    console.log(`[通知] ${title}\n${content}`);
+        if (notify && typeof notify.sendNotify === 'function') {
+            await notify.sendNotify(title, content);
+            console.log(`✅ ${getFormattedTimestamp()} 已通过 sendNotify 推送`);
+            return true;
+        }
+    } catch (e) { /* sendNotify.js 不存在或加载失败 */ }
+    return false;
 }
 
 // 调用 Arcadia 内部消息接口，成功返回 true，任何失败均静默返回 false
